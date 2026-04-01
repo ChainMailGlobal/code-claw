@@ -21,6 +21,10 @@ class Config:
     # Anthropic — Claude Code CLI auth
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 
+    # MMCP — internal API auth
+    MMCP_URL: str = os.getenv("MMCP_URL", "http://localhost:5000")
+    MMCP_UI_TOKEN: str = os.getenv("MMCP_UI_TOKEN", "")
+
     # Model selection for planning
     MODEL_CODING: str = os.getenv("MODEL_CODING", "deepseek-ai/DeepSeek-V3-0324")
     MODEL_REASONING: str = os.getenv("MODEL_REASONING", "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1")

@@ -10,6 +10,7 @@ from claude_process import claude_manager
 from config import Config
 from executor import execute
 from github_handler import clone, commit
+from memory import flush_queue, query_mag, write_bubble
 from planner import plan_implementation
 from router import route_instruction
 from session_store import store
@@ -17,6 +18,19 @@ from tts_engine import synthesize
 from vision import qwen_observe
 
 app = FastAPI(title="code-claw")
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_flush_queue_on_startup())
+
+
+async def _flush_queue_on_startup():
+    await flush_queue()
 
 
 # ---------------------------------------------------------------------------
@@ -190,14 +204,19 @@ async def execute_endpoint(
         except Exception:
             pass
 
-    # 3. Build repo context for Mistral
+    # 3. Query MAG for memory context
+    mag_context = await query_mag(body.instruction)
+
+    # 4. Build repo context for Mistral
     repo_context = None
     if session.has_repo():
         repo_context = await loop.run_in_executor(
             None, _build_repo_context, session.local_path, body.active_file
         )
+        if mag_context:
+            repo_context = f"{mag_context}\n\n{repo_context}"
 
-    # 4. Mistral + Qwen listen in parallel
+    # 5. Mistral + Qwen listen in parallel
     visual_context = None
     mistral_task = route_instruction(
         body.instruction,
@@ -208,10 +227,10 @@ async def execute_endpoint(
     qwen_task = qwen_observe(body.instruction, body.image_base64)
     routing, qwen_context = await asyncio.gather(mistral_task, qwen_task)
 
-    # 5. Store user turn in conversation (persisted to disk)
+    # 6. Store user turn in conversation (persisted to disk)
     await store.add_turn(body.session_id, "user", body.instruction)
 
-    # 6. Decision loop — ask or execute
+    # 7. Decision loop — ask or execute
     if routing.get("action") == "ask":
         question = routing.get("question", "Can you clarify what you'd like to do?")
         await store.add_turn(body.session_id, "assistant", f"[asked]: {question}")
@@ -224,7 +243,7 @@ async def execute_endpoint(
             audio_base64=audio_b64,
         )
 
-    # 7. Token Factory planning pass — Mistral classifies, TF model writes spec
+    # 8. Token Factory planning pass — Mistral classifies, TF model writes spec
     mistral_prompt = routing.get("prompt", body.instruction)
     plan = await plan_implementation(
         mistral_prompt,
@@ -247,20 +266,31 @@ async def execute_endpoint(
     # "direct" uses Mistral prompt as-is; "plan" uses Token Factory spec
     claude_prompt = plan.get("spec", mistral_prompt) if plan.get("action") == "plan" else mistral_prompt
 
-    # 8. Execute Claude Code (blocking → threadpool)
+    # 9. Execute Claude Code (blocking → threadpool)
     repo_path = session.local_path if session.has_repo() else Config.WORKSPACE_DIR
     result = await loop.run_in_executor(None, execute, claude_prompt, repo_path)
 
-    # 9. Store assistant turn (persisted to disk)
+    # 10. Store assistant turn (persisted to disk)
     await store.add_turn(body.session_id, "assistant", f"[executed]: {result['output'][:500]}")
 
-    # 10. Build spoken response
+    # 11. Write bubble to memory
+    if result["returncode"] == 0:
+        await write_bubble(
+            session_id=body.session_id,
+            content=result["output"],
+            source="claude_code",
+            context=claude_prompt,
+            repo_name=session.repo_name,
+            tier=plan.get("tier", "unknown"),
+        )
+
+    # 12. Build spoken response
     if result["returncode"] == 0:
         spoken = f"Done. {result['output']}"
     else:
         spoken = f"Error. {result['output']}"
 
-    # 11. TTS
+    # 13. TTS
     audio_b64 = await loop.run_in_executor(None, synthesize, spoken)
 
     return ExecuteResponse(
@@ -300,12 +330,17 @@ async def execute_stream_endpoint(
         except Exception:
             pass
 
+    # Query MAG for memory context
+    mag_context = await query_mag(body.instruction)
+
     # Repo context
     repo_context = None
     if session.has_repo():
         repo_context = await loop.run_in_executor(
             None, _build_repo_context, session.local_path, body.active_file
         )
+        if mag_context:
+            repo_context = f"{mag_context}\n\n{repo_context}"
 
     # Mistral + Qwen in parallel
     routing, qwen_context = await asyncio.gather(
@@ -361,6 +396,17 @@ async def execute_stream_endpoint(
         full_text = "".join(full_output)
         await store.add_turn(body.session_id, "assistant", f"[executed]: {full_text[:500]}")
 
+        # Write bubble to memory
+        if full_text:
+            await write_bubble(
+                session_id=body.session_id,
+                content=full_text,
+                source="claude_code",
+                context=claude_prompt,
+                repo_name=session.repo_name,
+                tier=plan.get("tier", "unknown"),
+            )
+
         # TTS of summary
         spoken = f"Done. {full_text}" if full_text else "Done."
         audio_b64 = await loop.run_in_executor(None, synthesize, spoken)
@@ -405,11 +451,16 @@ async def execute_swarm_endpoint(
                 except Exception:
                     pass
 
+            # Query MAG for memory context
+            mag_context = await query_mag(task.instruction)
+
             repo_context = None
             if session.has_repo():
                 repo_context = await loop.run_in_executor(
                     None, _build_repo_context, session.local_path, task.active_file
                 )
+                if mag_context:
+                    repo_context = f"{mag_context}\n\n{repo_context}"
 
             # Mistral routing + Qwen vision in parallel
             routing, qwen_context = await asyncio.gather(
@@ -445,6 +496,17 @@ async def execute_swarm_endpoint(
             result = await loop.run_in_executor(None, execute, claude_prompt, repo_path)
             output = result["output"]
             await store.add_turn(task.session_id, "assistant", f"[executed]: {output[:500]}")
+
+            # Write bubble to memory
+            if result["returncode"] == 0:
+                await write_bubble(
+                    session_id=task.session_id,
+                    content=output,
+                    source="claude_code",
+                    context=claude_prompt,
+                    repo_name=session.repo_name,
+                    tier=plan.get("tier", "unknown"),
+                )
 
             status = "Done." if result["returncode"] == 0 else f"Error. {output[:200]}"
             return SwarmTaskResult(session_id=task.session_id, action="executed", text=status)
