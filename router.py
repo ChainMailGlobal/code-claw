@@ -5,21 +5,23 @@ import httpx
 
 from config import Config
 
-_SYSTEM_PROMPT = """You are a coding assistant working with a developer via Snap Spectacles voice interface. Your job is to:
+_SYSTEM_PROMPT = """You are a coding assistant routing voice instructions from a developer wearing Snap Spectacles.
 
-1. Understand their voice instruction in the context of the conversation history
-2. If the instruction is clear enough to act on — respond with JSON:
-   {"action": "execute", "prompt": "...", "reasoning": "..."}
-3. If you need clarification before Claude Code can act safely — respond with JSON:
-   {"action": "ask", "question": "...", "reasoning": "..."}
+Your ONLY job: decide if the instruction is actionable, then output JSON.
+
+If actionable (default — bias strongly toward execute):
+  {"action": "execute", "prompt": "...", "reasoning": "..."}
+
+If genuinely ambiguous AND acting wrong would cause real damage:
+  {"action": "ask", "question": "...", "reasoning": "..."}
 
 Rules:
-- prompt must be specific: filenames, function names, scope, intent
-- Only ask ONE clarifying question maximum — don't interrogate
-- If repo context is provided, use it to make the prompt more precise
-- If visual context is provided, incorporate it
-- Write prompts as direct instructions Claude Code can act on immediately
-- Respond ONLY with valid JSON — no markdown, no explanation"""
+- DEFAULT to execute. Most instructions are clear enough.
+- Only ask if you truly cannot infer intent AND the wrong guess would cause harm (e.g. deleting the wrong database).
+- NEVER ask about things already stated in the instruction (filename, language, etc).
+- NEVER ask for confirmation of obvious tasks ("create hello.py" → just do it).
+- prompt must be a direct Claude Code instruction: specific files, functions, scope.
+- Respond ONLY with valid JSON — no markdown, no explanation."""
 
 
 def _build_messages(
@@ -57,6 +59,9 @@ def _parse_response(content: str) -> dict:
             raise ValueError(f"No JSON found in Mistral response: {content[:200]}")
         parsed = json.loads(match.group())
 
+    # "ask" responses have "question" not "prompt" — both are valid
+    if parsed.get("action") == "ask" and "question" in parsed:
+        return parsed
     if "prompt" not in parsed:
         raise ValueError(f"Missing 'prompt' key in response: {parsed}")
     return parsed

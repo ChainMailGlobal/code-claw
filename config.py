@@ -13,6 +13,19 @@ class Config:
     )
     QWEN_MODEL: str = os.getenv("QWEN_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
 
+    # Token Factory API (Nebius) — large model planning pass
+    TOKEN_FACTORY_API_KEY: str = os.getenv("TOKEN_FACTORY_API_KEY", "")
+    TOKEN_FACTORY_BASE_URL: str = os.getenv(
+        "TOKEN_FACTORY_BASE_URL", "https://api.tokenfactory.nebius.com/v1"
+    )
+    # Anthropic — Claude Code CLI auth
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+
+    # Model selection for planning
+    MODEL_CODING: str = os.getenv("MODEL_CODING", "deepseek-ai/DeepSeek-V3-0324")
+    MODEL_REASONING: str = os.getenv("MODEL_REASONING", "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1")
+    MODEL_THINKING: str = os.getenv("MODEL_THINKING", "deepseek-ai/DeepSeek-R1-0528")
+
     # GitHub
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
 
@@ -39,6 +52,10 @@ class Config:
     @classmethod
     def qwen_chat_url(cls) -> str:
         return f"{cls.QWEN_URL}/v1/chat/completions"
+
+    @classmethod
+    def token_factory_chat_url(cls) -> str:
+        return f"{cls.TOKEN_FACTORY_BASE_URL}/chat/completions"
 
     @classmethod
     def active_repo_path(cls) -> str:

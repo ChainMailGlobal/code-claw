@@ -10,6 +10,7 @@ from claude_process import claude_manager
 from config import Config
 from executor import execute
 from github_handler import clone, commit
+from planner import plan_implementation
 from router import route_instruction
 from session_store import store
 from tts_engine import synthesize
@@ -51,6 +52,27 @@ class ExecuteResponse(BaseModel):
     action: str          # "executed" or "asked"
     text: str
     audio_base64: str
+
+
+class SwarmTask(BaseModel):
+    session_id: str
+    instruction: str
+    repo_url: str | None = None   # optional — clones fresh if provided
+    active_file: str | None = None
+
+class SwarmRequest(BaseModel):
+    tasks: list[SwarmTask]
+    image_base64: str | None = None  # shared visual context for all tasks
+
+class SwarmTaskResult(BaseModel):
+    session_id: str
+    action: str
+    text: str
+
+class SwarmResponse(BaseModel):
+    results: list[SwarmTaskResult]
+    total: int
+    succeeded: int
 
 
 class RepoRequest(BaseModel):
@@ -202,10 +224,28 @@ async def execute_endpoint(
             audio_base64=audio_b64,
         )
 
-    # 7. Build Claude Code prompt with all context
-    claude_prompt = routing.get("prompt", body.instruction)
-    if qwen_context:
-        claude_prompt += f"\n\n[Qwen context]: {qwen_context}"
+    # 7. Token Factory planning pass — Mistral classifies, TF model writes spec
+    mistral_prompt = routing.get("prompt", body.instruction)
+    plan = await plan_implementation(
+        mistral_prompt,
+        session.conversation,
+        repo_context,
+        qwen_context,
+    )
+
+    if plan.get("action") == "ask":
+        question = plan["question"]
+        await store.add_turn(body.session_id, "assistant", f"[planner-asked]: {question}")
+        audio_b64 = await loop.run_in_executor(None, synthesize, question)
+        return ExecuteResponse(
+            session_id=body.session_id,
+            action="asked",
+            text=question,
+            audio_base64=audio_b64,
+        )
+
+    # "direct" uses Mistral prompt as-is; "plan" uses Token Factory spec
+    claude_prompt = plan.get("spec", mistral_prompt) if plan.get("action") == "plan" else mistral_prompt
 
     # 8. Execute Claude Code (blocking → threadpool)
     repo_path = session.local_path if session.has_repo() else Config.WORKSPACE_DIR
@@ -291,11 +331,25 @@ async def execute_stream_endpoint(
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
             return
 
-        # Build Claude Code prompt
-        claude_prompt = routing.get("prompt", body.instruction)
-        if qwen_context:
-            claude_prompt += f"\n\n[Qwen context]: {qwen_context}"
+        # Token Factory planning pass
+        mistral_prompt = routing.get("prompt", body.instruction)
+        plan = await plan_implementation(
+            mistral_prompt,
+            session.conversation,
+            repo_context,
+            qwen_context,
+        )
 
+        if plan.get("action") == "ask":
+            question = plan["question"]
+            await store.add_turn(body.session_id, "assistant", f"[planner-asked]: {question}")
+            yield f"data: {json.dumps({'type': 'question', 'text': question})}\n\n"
+            audio_b64 = await loop.run_in_executor(None, synthesize, question)
+            yield f"data: {json.dumps({'type': 'audio', 'audio_base64': audio_b64})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+
+        claude_prompt = plan.get("spec", mistral_prompt) if plan.get("action") == "plan" else mistral_prompt
         repo_path = session.local_path if session.has_repo() else Config.WORKSPACE_DIR
 
         # Stream Claude Code output chunk by chunk → HUD
@@ -321,6 +375,86 @@ async def execute_stream_endpoint(
             "X-Accel-Buffering": "no",  # disable nginx buffering
         },
     )
+
+
+@app.post("/execute/swarm", response_model=SwarmResponse)
+async def execute_swarm_endpoint(
+    body: SwarmRequest, _: None = Depends(verify_token)
+):
+    """
+    Parallel swarm execution — up to 100 tasks simultaneously.
+    Each task runs the full pipeline: Mistral → planner → Claude Code.
+    All tasks run concurrently via asyncio.gather().
+    """
+    loop = asyncio.get_running_loop()
+
+    async def run_task(task: SwarmTask) -> SwarmTaskResult:
+        try:
+            session = await store.get_or_create(task.session_id)
+
+            # Git pull if repo set
+            if session.has_repo():
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: __import__("subprocess").run(
+                            ["git", "-C", session.local_path, "pull", "--ff-only"],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                    )
+                except Exception:
+                    pass
+
+            repo_context = None
+            if session.has_repo():
+                repo_context = await loop.run_in_executor(
+                    None, _build_repo_context, session.local_path, task.active_file
+                )
+
+            # Mistral routing + Qwen vision in parallel
+            routing, qwen_context = await asyncio.gather(
+                route_instruction(
+                    task.instruction,
+                    visual_context=None,
+                    conversation=session.conversation,
+                    repo_context=repo_context,
+                ),
+                qwen_observe(task.instruction, body.image_base64),
+            )
+
+            await store.add_turn(task.session_id, "user", task.instruction)
+
+            if routing.get("action") == "ask":
+                question = routing.get("question", "Can you clarify?")
+                await store.add_turn(task.session_id, "assistant", f"[asked]: {question}")
+                return SwarmTaskResult(session_id=task.session_id, action="asked", text=question)
+
+            mistral_prompt = routing.get("prompt", task.instruction)
+            plan = await plan_implementation(
+                mistral_prompt, session.conversation, repo_context, qwen_context
+            )
+
+            if plan.get("action") == "ask":
+                question = plan["question"]
+                await store.add_turn(task.session_id, "assistant", f"[planner-asked]: {question}")
+                return SwarmTaskResult(session_id=task.session_id, action="asked", text=question)
+
+            claude_prompt = plan.get("spec", mistral_prompt) if plan.get("action") == "plan" else mistral_prompt
+            repo_path = session.local_path if session.has_repo() else Config.WORKSPACE_DIR
+
+            result = await loop.run_in_executor(None, execute, claude_prompt, repo_path)
+            output = result["output"]
+            await store.add_turn(task.session_id, "assistant", f"[executed]: {output[:500]}")
+
+            status = "Done." if result["returncode"] == 0 else f"Error. {output[:200]}"
+            return SwarmTaskResult(session_id=task.session_id, action="executed", text=status)
+
+        except Exception as e:
+            return SwarmTaskResult(session_id=task.session_id, action="error", text=str(e))
+
+    results = await asyncio.gather(*[run_task(t) for t in body.tasks])
+    succeeded = sum(1 for r in results if r.action == "executed")
+    return SwarmResponse(results=list(results), total=len(results), succeeded=succeeded)
 
 
 @app.post("/repo", response_model=RepoResponse)
