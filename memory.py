@@ -11,6 +11,7 @@ BUBBLE_QUEUE_DIR = os.path.join(Config.DATA_DIR, "bubble_queue")
 os.makedirs(BUBBLE_QUEUE_DIR, exist_ok=True)
 
 MMCP_URL = Config.MMCP_URL
+OWNER_ACCOUNT_ID = Config.OWNER_ACCOUNT_ID
 
 
 def _mmcp_headers() -> dict:
@@ -41,6 +42,7 @@ async def write_bubble(
             "context": context[:500],
             "repo_name": repo_name,
             "tier": tier,
+            "owner_account_id": OWNER_ACCOUNT_ID,
         },
     }
     try:
@@ -69,6 +71,7 @@ async def query_mag(query: str, top_k: int = 5) -> str:
                     "top_k": top_k,
                     "actor_aio": "AIO_CODE_CLAW",
                     "envelope_id": "GE_BUILD",
+                    "owner_account_id": OWNER_ACCOUNT_ID,
                 },
             )
             resp.raise_for_status()

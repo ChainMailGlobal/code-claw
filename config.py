@@ -24,6 +24,8 @@ class Config:
     # MMCP — internal API auth
     MMCP_URL: str = os.getenv("MMCP_URL", "http://localhost:5000")
     MMCP_UI_TOKEN: str = os.getenv("MMCP_UI_TOKEN", "")
+    # Memory isolation — owner scope for bubble tagging and MAG queries
+    OWNER_ACCOUNT_ID: str = os.getenv("OWNER_ACCOUNT_ID", "chainmail")
 
     # Model selection for planning
     MODEL_CODING: str = os.getenv("MODEL_CODING", "deepseek-ai/DeepSeek-V3-0324")
